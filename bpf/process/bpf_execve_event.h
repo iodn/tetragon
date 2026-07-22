@@ -30,6 +30,10 @@ read_args(void *ctx, struct msg_execve_event *event)
 	long off;
 	int err;
 
+#ifdef __LARGE_BPF_PROG
+	event->heap_args.len = 0;
+#endif
+
 	with_errmetrics(probe_read, &mm, sizeof(mm), _(&task->mm));
 	if (!mm)
 		return 0;
@@ -52,11 +56,22 @@ read_args(void *ctx, struct msg_execve_event *event)
 		return 0;
 
 	start_stack += off;
+	if (start_stack > end_stack)
+		return 0;
+	args_size = end_stack - start_stack;
 
 	size = p->size & 0x1ff /* 2*MAXARGLENGTH - 1*/;
 	args = (char *)p + size;
 #ifdef __LARGE_BPF_PROG
-	event->exe.arg_start = size;
+	__u32 args_length;
+
+	if (args_size > sizeof(event->heap_args.buf))
+		args_length = sizeof(event->heap_args.buf);
+	else
+		args_length = args_size;
+	if (args_length &&
+	    with_errmetrics(probe_read, event->heap_args.buf, args_length, (char *)start_stack) >= 0)
+		event->heap_args.len = args_length;
 #endif
 
 	if (args >= (char *)&event->process + BUFFER)
@@ -66,7 +81,6 @@ read_args(void *ctx, struct msg_execve_event *event)
 	 * or use data event to send it separatelly.
 	 */
 	free_size = (char *)&event->process + BUFFER - args;
-	args_size = end_stack - start_stack;
 
 	if (args_size < BUFFER && args_size < free_size) {
 		if (args_size)
@@ -85,9 +99,6 @@ read_args(void *ctx, struct msg_execve_event *event)
 		if (size > 0)
 			p->flags |= EVENT_DATA_ARGS;
 	}
-#ifdef __LARGE_BPF_PROG
-	event->exe.arg_len = size;
-#endif
 	p->size_args = (__u16)size;
 	return size;
 }
@@ -365,22 +376,15 @@ execve_send_event(struct bpf_raw_tracepoint_args *ctx,
 		/* zero out previous paths in ->bin */
 		binary_reset(&curr->bin);
 #ifdef __LARGE_BPF_PROG
-		__u32 off, len;
-
 		// read from proc exe stored at execve time
 		copy_exe_to_bin(&event->exe, &curr->bin);
 
-		off = event->exe.arg_start;
-		if (event->exe.arg_len > sizeof(curr->bin.args) - 2)
-			len = sizeof(curr->bin.args) - 2;
-		else
-			len = event->exe.arg_len;
-		with_errmetrics(probe_read, curr->bin.args, len, (char *)&event->process + off);
-
-		// there's a null byte between each argv element, so we terminate with
-		// two of them to make it possible to identify the end of the buffer
-		curr->bin.args[len] = 0x00;
-		curr->bin.args[len + 1] = 0x00;
+		if (event->heap_args.len <= sizeof(curr->args.buf)) {
+			curr->args.len = event->heap_args.len;
+			if (event->heap_args.len)
+				with_errmetrics(probe_read, curr->args.buf, event->heap_args.len,
+						(char *)event->heap_args.buf);
+		}
 #else
 		struct linux_binprm *bprm = (struct linux_binprm *)ctx->args[2];
 		char *filename;
