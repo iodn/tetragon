@@ -529,6 +529,9 @@ func initProcessInternalClone(event *tetragonAPI.MsgCloneEvent,
 
 // GetPodInfo constructs and returns the Kubernetes Pod information associated with an event.
 func GetPodInfo(containerID, bin, args string, nspid uint32) *tetragon.Pod {
+	if k8s == nil {
+		return nil
+	}
 	return getPodInfo(k8s, containerID, bin, args, nspid)
 }
 
